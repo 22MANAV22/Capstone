@@ -1,4 +1,4 @@
-# 🚀 SkyLens 360 – End-to-End Data Engineering Pipeline
+# 🚀 Ecomm360 – End-to-End Data Engineering Pipeline
 
 ![Architecture](https://img.shields.io/badge/Architecture-Medallion-blue)
 ![Cloud](https://img.shields.io/badge/Cloud-AWS-orange)
