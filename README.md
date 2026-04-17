@@ -10,7 +10,7 @@
 
 ## 📌 Overview
 
-**SkyLens 360** is a scalable **end-to-end data engineering pipeline** designed to process both **batch and near real-time data** for an e-commerce platform.
+**Ecomm360** is a scalable **end-to-end data engineering pipeline** designed to process both **batch and near real-time data** for an e-commerce platform.
 
 The project simulates real-world production systems by implementing:
 
@@ -264,8 +264,8 @@ Displays:
 ### 1. Clone Repo
 
 ```bash
-git clone https://github.com/your-username/skylens360.git
-cd skylens360
+git clone https://github.com/your-username/Ecomm360.git
+cd Ecomm360
 ```
 
 ---
