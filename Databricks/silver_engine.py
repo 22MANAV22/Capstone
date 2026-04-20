@@ -139,7 +139,7 @@ class SilverEngine:
             .option("overwriteSchema", "true") \
             .save(s3_path)
 
-        # 🔥 Fix location mismatch
+        # Fix location mismatch
         self.spark.sql(f"DROP TABLE IF EXISTS silver.{table_name}")
 
         self.spark.sql(f"""
@@ -162,7 +162,7 @@ class SilverEngine:
         try:
             df = self.spark.read.format("delta").load(f"{S3_DELTA_BRONZE}/{table_name}")
         except Exception as e:
-            print(f"    ❌ ERROR reading bronze: {e}")
+            print(f"     ERROR reading bronze: {e}")
             return
 
         # cleaning
