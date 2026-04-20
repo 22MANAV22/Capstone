@@ -137,7 +137,7 @@ class GoldEngine:
         export_path = f"s3://capstone-ecomm-team8/snowflake/{table_name}"
 
         (
-           df.coalesce(1)   # 👈 important (single clean file)
+           df.coalesce(1)   #  important (single clean file)
              .write
              .mode("overwrite")
              .parquet(export_path)
