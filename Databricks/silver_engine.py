@@ -42,7 +42,7 @@ class SilverEngine:
         elif a == "cast_string":
             return df.withColumn(c, col(c).cast("string"))
 
-        # 🔥 SAFE CASTS (NO CRASH)
+        # SAFE CASTS (NO CRASH)
         elif a == "cast_double":
             return df.withColumn(c, expr(f"try_cast({c} as double)"))
 
