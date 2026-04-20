@@ -1,8 +1,8 @@
 #!/bin/bash
 
 ################################################################################
-# AIRFLOW ON EC2 - AUTOMATED SETUP SCRIPT
-# Version: 2.0 - Production Ready
+# AIRFLOW ON EC2 - AUTOMATED SETUP SCRIPT (FIXED VERSION)
+# Version: 2.1 - Production Ready (Config syntax fixed!)
 # Execution: One command setup - everything automated!
 # Time: ~5-10 minutes total
 ################################################################################
@@ -190,6 +190,7 @@ if [ -f ~/airflow/airflow.cfg ]; then
 fi
 
 # Create new optimized config
+# NOTE: Using %%  to escape % signs in logging format for configparser
 cat > ~/airflow/airflow.cfg << 'EOF'
 [core]
 dags_folder = /home/ubuntu/airflow/dags
@@ -222,8 +223,8 @@ catchup_by_default = False
 dag_file_stat_interval = 10
 
 [logging]
-log_format = [%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s
-simple_log_format = %(asctime)s - %(levelname)s - %(message)s
+log_format = [%%(asctime)s] {%%(filename)s:%%(lineno)d} %%(levelname)s - %%(message)s
+simple_log_format = %%(asctime)s - %%(levelname)s - %%(message)s
 
 [database]
 sql_engine_encoding = utf-8
