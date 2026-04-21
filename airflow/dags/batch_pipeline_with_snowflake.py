@@ -1,6 +1,3 @@
-"""
-Batch Pipeline — Airflow
-"""
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
@@ -19,6 +16,9 @@ class BatchPipeline:
         self.nb_root = nb_root
         self.sf_conn = sf_conn
 
+    # -------------------------
+    # ALERTS
+    # -------------------------
     def send_sns(self, subject, message):
         try:
             boto3.client('sns', region_name='us-east-1').publish(
@@ -29,14 +29,25 @@ class BatchPipeline:
         except Exception as e:
             print(f"SNS failed: {e}")
 
+    def on_success(self, context):
+        task = context['task_instance'].task_id
+        batch = context['dag_run'].conf.get('batch_number', '?')
+        self.send_sns(
+            f"SUCCESS: batch_{batch}/{task}",
+            f"{task} completed for batch {batch}"
+        )
+
     def on_failure(self, context):
         task = context['task_instance'].task_id
         batch = context['dag_run'].conf.get('batch_number', '?')
         self.send_sns(
             f"FAILURE: batch_{batch}/{task}",
-            f"Batch {batch}, {task} FAILED: {context.get('exception','?')}"
+            f"{task} FAILED for batch {batch}"
         )
 
+    # -------------------------
+    # S3 MOVE
+    # -------------------------
     def move_s3(self, **context):
         batch = context['dag_run'].conf.get('batch_number', '2')
         src = f"staging/batch_{batch}/"
@@ -69,9 +80,12 @@ class BatchPipeline:
         batch = context['dag_run'].conf.get('batch_number', '?')
         self.send_sns(
             f"BATCH {batch} COMPLETE",
-            f"Batch {batch} completed at {datetime.now()}"
+            f"Batch {batch} finished successfully at {datetime.now()}"
         )
 
+    # -------------------------
+    # DAG
+    # -------------------------
     def build_dag(self):
         with DAG(
             dag_id='batch_pipeline',
@@ -110,27 +124,32 @@ class BatchPipeline:
                         "batch_number": '{{ dag_run.conf.get("batch_number","2") }}'
                     },
                 },
+                on_success_callback=self.on_success
             )
 
             silver = DatabricksSubmitRunOperator(
                 task_id='run_silver',
                 databricks_conn_id=self.db_conn,
-                notebook_task={"notebook_path": f"{self.nb_root}/run_silver"},
+                notebook_task={
+                    "notebook_path": f"{self.nb_root}/run_silver"
+                },
+                on_success_callback=self.on_success
             )
 
             gold = DatabricksSubmitRunOperator(
                 task_id='run_gold',
                 databricks_conn_id=self.db_conn,
-                notebook_task={"notebook_path": f"{self.nb_root}/run_gold"},
+                notebook_task={
+                    "notebook_path": f"{self.nb_root}/run_gold"
+                },
+                on_success_callback=self.on_success
             )
-            
 
             def sf_task(task_id, table):
                 return SQLExecuteQueryOperator(
                     task_id=task_id,
                     conn_id=self.sf_conn,
                     sql=f"""
-
                         TRUNCATE TABLE {table};
 
                         COPY INTO {table}
@@ -161,9 +180,9 @@ class BatchPipeline:
 
 batch_pipeline = BatchPipeline(
     bucket="capstone-ecomm-team8",
-    sns_arn="arn:aws:sns:us-east-1:YOUR_ACCOUNT:capstone-pipeline-alerts",
+    sns_arn="arn:aws:sns:us-east-1:868859238853:Capstone-team8",
     db_conn="databricks_default",
-    nb_root="/Shared/capstone",
+    nb_root="/Shared/Capstone",
     sf_conn="snowflake_default"
 )
 
