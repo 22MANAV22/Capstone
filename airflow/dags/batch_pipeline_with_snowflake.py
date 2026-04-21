@@ -1,5 +1,5 @@
 """
-Batch Pipeline — Airflow 3 compatible
+Batch Pipeline — Airflow
 """
 from airflow import DAG
 from airflow.operators.python import PythonOperator
