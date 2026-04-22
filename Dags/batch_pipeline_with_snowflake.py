@@ -1,207 +1,239 @@
 """
-Batch Pipeline — ONE parameterized DAG, triggered 3 times.
+batch_pipeline.py — Airflow DAG for batch processing.
 
-Batch 1: Manual in Databricks (NOT here).
-Batch 2: airflow dags trigger batch_pipeline --conf '{"batch_number":"2"}'
-Batch 3: airflow dags trigger batch_pipeline --conf '{"batch_number":"3"}'
-Batch 4: airflow dags trigger batch_pipeline --conf '{"batch_number":"4"}'
+Triggered manually 3 times (for batches 2, 3, 4) after Batch 1 is
+tested manually in Databricks.
 
-Each trigger: move → sense → bronze → silver → gold → snowflake_load → notify
+Full flow per trigger:
+  move_staging_to_raw
+    → sense_raw_files
+    → run_bronze
+    → run_silver
+    → run_gold
+    → snowflake_load  (all 9 tables in one task)
+    → notify_complete
+
+SNS notification: one email per DAG run only (success at end, failure on any task).
+
+How to trigger from EC2:
+  airflow dags trigger batch_pipeline --conf '{"batch_number": "2"}'
+  airflow dags trigger batch_pipeline --conf '{"batch_number": "3"}'
+  airflow dags trigger batch_pipeline --conf '{"batch_number": "4"}'
 """
+
+import boto3
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.providers.databricks.operators.databricks import DatabricksSubmitRunOperator
-from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
-from airflow.utils.dates import days_ago
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from datetime import datetime, timedelta
-import boto3
 
 
 class BatchPipeline:
 
     def __init__(self, bucket, sns_arn, db_conn, nb_root, sf_conn):
-        self.bucket = bucket
+        self.bucket  = bucket
         self.sns_arn = sns_arn
         self.db_conn = db_conn
         self.nb_root = nb_root
         self.sf_conn = sf_conn
 
-    def send_sns(self, subject, message):
-        try:
-            boto3.client('sns', region_name='us-east-1').publish(
-                TopicArn=self.sns_arn, Subject=subject[:100], Message=message)
-        except Exception as e:
-            print(f"SNS failed: {e}")
+    # ── SNS — one notification per DAG run ───────────────────────────────────
 
-    def on_success(self, context):
-        task = context['task_instance'].task_id
-        batch = context['dag_run'].conf.get('batch_number', '?')
-        self.send_sns(f"SUCCESS: batch_{batch}/{task}",
-                      f"Batch {batch}, {task} done at {datetime.now()}")
+    def _publish_sns(self, subject, message):
+        """
+        Pull credentials from aws_default Airflow connection explicitly.
+        boto3 alone cannot find them — Airflow does not inject them as
+        environment variables automatically.
+        """
+        try:
+            from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+            hook  = S3Hook(aws_conn_id="aws_default")
+            creds = hook.get_credentials()
+            sns   = boto3.client(
+                "sns",
+                region_name="us-east-1",
+                aws_access_key_id=creds.access_key,
+                aws_secret_access_key=creds.secret_key,
+            )
+            sns.publish(
+                TopicArn=self.sns_arn,
+                Subject=subject[:100],
+                Message=message
+            )
+            print(f"SNS sent: {subject}")
+        except Exception as e:
+            print(f"SNS skipped: {e}")
 
     def on_failure(self, context):
-        task = context['task_instance'].task_id
-        batch = context['dag_run'].conf.get('batch_number', '?')
-        self.send_sns(f"FAILURE: batch_{batch}/{task}",
-                      f"Batch {batch}, {task} FAILED: {context.get('exception','?')}")
+        """Called once when any task fails — sent via default_args."""
+        task  = context["task_instance"].task_id
+        batch = context["dag_run"].conf.get("batch_number", "?")
+        self._publish_sns(
+            f"FAILURE: batch_{batch} — {task}",
+            f"Task '{task}' FAILED for batch {batch}.\n"
+            f"DAG run: {context['dag_run'].run_id}\n"
+            f"Check Airflow logs for details."
+        )
 
-    def move_s3(self, **context):
-        batch = context['dag_run'].conf.get('batch_number', '2')
-        src = f"staging/batch_{batch}/"
-        dst = f"raw/batch_{batch}/"
-        s3 = boto3.client('s3', region_name='us-east-1')
-        resp = s3.list_objects_v2(Bucket=self.bucket, Prefix=src)
-        if 'Contents' not in resp:
-            print(f"No files in {src}")
+    def notify_complete(self, **context):
+        """Called once at the very end of a successful DAG run."""
+        batch = context["dag_run"].conf.get("batch_number", "?")
+        self._publish_sns(
+            f"Batch {batch} complete",
+            f"Full pipeline for batch {batch} finished successfully "
+            f"at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\n\n"
+            f"All Bronze, Silver, Gold and Snowflake tasks completed."
+        )
+
+    # ── Task callables ────────────────────────────────────────────────────────
+
+    def move_staging_to_raw(self, **context):
+        batch = context["dag_run"].conf.get("batch_number", "2")
+        src   = f"staging/batch_{batch}/"
+        dst   = f"raw/batch_{batch}/"
+
+        hook       = S3Hook(aws_conn_id="aws_default")
+        keys       = hook.list_keys(bucket_name=self.bucket, prefix=src) or []
+        real_files = [k for k in keys if not k.endswith("/")]
+
+        if not real_files:
+            print(f"No files found in {src} — nothing to move")
             return
-        for obj in resp['Contents']:
-            k = obj['Key']
-            if k.endswith('/'):
-                continue
-            d = f"{dst}{k.split('/')[-1]}"
-            s3.copy_object(Bucket=self.bucket, CopySource={'Bucket': self.bucket, 'Key': k}, Key=d)
-            s3.delete_object(Bucket=self.bucket, Key=k)
-            print(f"Moved: {k} → {d}")
 
-    def notify_done(self, **context):
-        batch = context['dag_run'].conf.get('batch_number', '?')
-        self.send_sns(f"BATCH {batch} COMPLETE",
-                      f"Batch {batch}: Bronze→Silver→Gold→Snowflake done.\n"
-                      f"Check Snowflake warehouse for data.\nTime: {datetime.now()}")
+        for key in real_files:
+            dest_key = f"{dst}{key.split('/')[-1]}"
+            hook.copy_object(
+                source_bucket_name=self.bucket,
+                source_bucket_key=key,
+                dest_bucket_name=self.bucket,
+                dest_bucket_key=dest_key,
+            )
+            hook.delete_objects(bucket=self.bucket, keys=[key])
+            print(f"Moved: {key} → {dest_key}")
+
+    # ── Databricks task factory ───────────────────────────────────────────────
+
+    def _db_task(self, task_id, notebook, extra_params=None):
+        return DatabricksSubmitRunOperator(
+            task_id=task_id,
+            databricks_conn_id=self.db_conn,
+            run_name=f"batch_pipeline_{task_id}",
+            tasks=[{
+                "task_key"     : task_id,
+                "notebook_task": {
+                    "notebook_path"  : f"{self.nb_root}/{notebook}",
+                    "base_parameters": extra_params or {},
+                },
+            }],
+        )
+
+    # ── Snowflake — single task, all 9 tables ─────────────────────────────────
+
+    def snowflake_load(self):
+        """
+        Load all 9 Gold tables into Snowflake in one task.
+        Order: dims → fact → aggregates (respects star schema dependencies).
+        Each table: TRUNCATE first, then COPY INTO.
+        FORCE = TRUE ensures re-runs always reload even if files unchanged.
+        """
+        tables_in_order = [
+            "dim_customers",
+            "dim_sellers",
+            "dim_products",
+            "dim_geolocation",
+            "fact_order_items",
+            "order_summary",
+            "customer_metrics",
+            "seller_performance",
+            "product_performance",
+        ]
+
+        sql_statements = []
+        for table in tables_in_order:
+            sql_statements.append(f"TRUNCATE TABLE {table};")
+            sql_statements.append(f"""
+                COPY INTO {table}
+                FROM @gold_s3_stage/{table}/
+                FILE_FORMAT = (TYPE = 'PARQUET')
+                MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+                FORCE = TRUE
+                ON_ERROR = 'CONTINUE';
+            """)
+
+        return SQLExecuteQueryOperator(
+            task_id="snowflake_load",
+            conn_id=self.sf_conn,
+            sql=sql_statements,
+        )
+
+    # ── DAG ───────────────────────────────────────────────────────────────────
 
     def build_dag(self):
         with DAG(
-            'batch_pipeline',
+            dag_id="batch_pipeline",
             default_args={
-                'owner': 'capstone-team', 'retries': 2,
-                'retry_delay': timedelta(minutes=3),
-                'on_failure_callback': self.on_failure,
+                "owner"              : "capstone-team8",
+                "retries"            : 2,
+                "retry_delay"        : timedelta(minutes=3),
+                "on_failure_callback": self.on_failure,
             },
-            description='Batch: move→bronze→silver→gold→snowflake (one batch per trigger)',
-            schedule_interval=None,
-            start_date=days_ago(1),
+            schedule=None,
+            start_date=datetime(2024, 1, 1),
             catchup=False,
-            tags=['capstone', 'batch'],
+            tags=["capstone", "batch"],
         ) as dag:
 
             move = PythonOperator(
-                task_id='move_staging_to_raw',
-                python_callable=self.move_s3,
-                provide_context=True)
+                task_id="move_staging_to_raw",
+                python_callable=self.move_staging_to_raw,
+            )
 
             sense = S3KeySensor(
-                task_id='sense_files',
+                task_id="sense_raw_files",
                 bucket_name=self.bucket,
-                bucket_key='raw/batch_{{ dag_run.conf.get("batch_number", "2") }}/',
+                bucket_key='raw/batch_{{ dag_run.conf.get("batch_number", "2") }}/*',
                 wildcard_match=True,
-                aws_conn_id='aws_default',
-                timeout=300, poke_interval=15)
+                aws_conn_id="aws_default",
+                timeout=300,
+                poke_interval=15,
+            )
 
-            bronze = DatabricksSubmitRunOperator(
-                task_id='run_bronze',
-                databricks_conn_id=self.db_conn,
-                notebook_task={
-                    "notebook_path": f"{self.nb_root}/run_bronze",
-                    "base_parameters": {"batch_number": '{{ dag_run.conf.get("batch_number","2") }}'},
-                },
-                on_success_callback=self.on_success)
+            bronze = self._db_task(
+                "run_bronze", "run_bronze",
+                extra_params={
+                    "batch_number": '{{ dag_run.conf.get("batch_number", "2") }}'
+                }
+            )
+            silver = self._db_task(
+                "run_silver", "run_silver",
+                extra_params={
+                    "batch_number": '{{ dag_run.conf.get("batch_number", "2") }}'
+                }
+            )
+            gold = self._db_task("run_gold", "run_gold")
 
-            silver = DatabricksSubmitRunOperator(
-                task_id='run_silver',
-                databricks_conn_id=self.db_conn,
-                notebook_task={"notebook_path": f"{self.nb_root}/run_silver"},
-                on_success_callback=self.on_success)
-
-            gold = DatabricksSubmitRunOperator(
-                task_id='run_gold',
-                databricks_conn_id=self.db_conn,
-                notebook_task={"notebook_path": f"{self.nb_root}/run_gold"},
-                on_success_callback=self.on_success)
-
-            # ✅ NEW: Snowflake COPY INTO tasks
-            copy_fact_order_items = SnowflakeOperator(
-                task_id='copy_fact_order_items',
-                snowflake_conn_id=self.sf_conn,
-                sql=f"""
-                    COPY INTO fact_order_items
-                    FROM @gold_s3_stage/fact_order_items/
-                    FILE_FORMAT = (TYPE = 'PARQUET')
-                    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-                    ON_ERROR = 'CONTINUE';
-                """,
-                on_success_callback=self.on_success)
-
-            copy_order_summary = SnowflakeOperator(
-                task_id='copy_order_summary',
-                snowflake_conn_id=self.sf_conn,
-                sql="""
-                    COPY INTO order_summary
-                    FROM @gold_s3_stage/order_summary/
-                    FILE_FORMAT = (TYPE = 'PARQUET')
-                    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-                    ON_ERROR = 'CONTINUE';
-                """,
-                on_success_callback=self.on_success)
-
-            copy_customer_metrics = SnowflakeOperator(
-                task_id='copy_customer_metrics',
-                snowflake_conn_id=self.sf_conn,
-                sql="""
-                    COPY INTO customer_metrics
-                    FROM @gold_s3_stage/customer_metrics/
-                    FILE_FORMAT = (TYPE = 'PARQUET')
-                    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-                    ON_ERROR = 'CONTINUE';
-                """,
-                on_success_callback=self.on_success)
-
-            copy_seller_performance = SnowflakeOperator(
-                task_id='copy_seller_performance',
-                snowflake_conn_id=self.sf_conn,
-                sql="""
-                    COPY INTO seller_performance
-                    FROM @gold_s3_stage/seller_performance/
-                    FILE_FORMAT = (TYPE = 'PARQUET')
-                    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-                    ON_ERROR = 'CONTINUE';
-                """,
-                on_success_callback=self.on_success)
-
-            copy_product_performance = SnowflakeOperator(
-                task_id='copy_product_performance',
-                snowflake_conn_id=self.sf_conn,
-                sql="""
-                    COPY INTO product_performance
-                    FROM @gold_s3_stage/product_performance/
-                    FILE_FORMAT = (TYPE = 'PARQUET')
-                    MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-                    ON_ERROR = 'CONTINUE';
-                """,
-                on_success_callback=self.on_success)
+            sf_load = self.snowflake_load()
 
             notify = PythonOperator(
-                task_id='notify_complete',
-                python_callable=self.notify_done,
-                provide_context=True)
+                task_id="notify_complete",
+                python_callable=self.notify_complete,
+            )
 
-            # ✅ NEW: Pipeline includes Snowflake loads
-            move >> sense >> bronze >> silver >> gold >> [
-                copy_fact_order_items,
-                copy_order_summary,
-                copy_customer_metrics,
-                copy_seller_performance,
-                copy_product_performance
-            ] >> notify
+            # ── Wire ──────────────────────────────────────────────────────────
+            move >> sense >> bronze >> silver >> gold >> sf_load >> notify
 
         return dag
 
-# ✅ UPDATE THESE WITH YOUR VALUES:
-p = BatchPipeline(
-    bucket="capstone-ecomm-team8",  # ← Your bucket name
-    sns_arn="arn:aws:sns:us-east-1:YOUR_ACCOUNT:capstone-pipeline-alerts",
-    db_conn="databricks_default",
-    nb_root="/Shared/capstone",
-    sf_conn="snowflake_default")  # ← Snowflake connection
 
-dag = p.build_dag()
+# ── Instantiate ───────────────────────────────────────────────────────────────
+pipeline = BatchPipeline(
+    bucket  = "capstone-ecomm-team8",
+    sns_arn = "arn:aws:sns:us-east-1:868859238853:Capstone-team8",
+    db_conn = "databricks_default",
+    nb_root = "/Shared/Capstone",
+    sf_conn = "snowflake_default",
+)
+dag = pipeline.build_dag()

@@ -180,7 +180,7 @@ class BatchPipeline:
 
 batch_pipeline = BatchPipeline(
     bucket="capstone-ecomm-team8",
-    sns_arn="arn:aws:sns:us-east-1:868859238853:Capstone-team8",
+    sns_arn="arn:aws:sns:us-east-1:YOUR_ACCOUNT:capstone-pipeline-alerts",
     db_conn="databricks_default",
     nb_root="/Shared/Capstone",
     sf_conn="snowflake_default"
