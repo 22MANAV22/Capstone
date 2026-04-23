@@ -14,14 +14,37 @@ CHECKPOINT FIX:
   Previously checkpoint.mark_done() was called after ingesting reference
   tables even if all transactional tables failed. Now we track success/failure
   per table and only write checkpoint if ALL tables in the batch succeeded.
+
+SCHEMA FIX:
+  inferSchema=True is non-deterministic across CSV files. If a live file has
+  any ambiguous value (empty string, whitespace) in a column that was written
+  as IntegerType or DoubleType in a previous batch, Spark infers StringType
+  and Delta refuses to merge incompatible types on append.
+
+  Fix: _read_csv now accepts an optional schema_overrides dict
+  ({"column_name": DataType}) and casts those columns immediately after
+  reading, before any write. Bronze still uses inferSchema for discovery
+  but enforces types for columns declared in table_config cleaning_rules.
+  _apply_bronze_casts() extracts cast_int / cast_double / cast_string rules
+  from the config and applies them at read time so the DataFrame types always
+  match the existing Delta table schema.
 """
 
-from pyspark.sql.functions import current_timestamp, lit
+from pyspark.sql.functions import current_timestamp, lit, col
+from pyspark.sql.types import IntegerType, DoubleType, StringType
 from table_config import (
     REFERENCE_TABLES, TRANSACTIONAL_TABLES,
     S3_RAW, S3_LIVE, S3_DELTA_BRONZE
 )
 from checkpoint_manager import CheckpointManager
+
+
+# Map cleaning_rules action names → Spark DataTypes
+_CAST_ACTION_MAP = {
+    "cast_int":    IntegerType(),
+    "cast_double": DoubleType(),
+    "cast_string": StringType(),
+}
 
 
 class BronzeEngine:
@@ -32,6 +55,8 @@ class BronzeEngine:
         self.errors     = []   # track which tables failed
         self.checkpoint = CheckpointManager(spark)
 
+    # ── Read helpers ──────────────────────────────────────────────────────────
+
     def _read_csv(self, s3_path):
         return (
             self.spark.read
@@ -39,6 +64,27 @@ class BronzeEngine:
             .option("inferSchema", True)
             .csv(s3_path)
         )
+
+    def _apply_bronze_casts(self, df, table_cfg):
+        """
+        Apply cast_int / cast_double / cast_string rules from cleaning_rules
+        immediately after reading CSV, before any Delta write.
+
+        This keeps Bronze types consistent across batches regardless of how
+        inferSchema resolves individual files — prevents DELTA_MERGE_INCOMPATIBLE
+        errors on append (e.g. review_score inferred as String in live files).
+        """
+        for rule in table_cfg.get("cleaning_rules", []):
+            action  = rule.get("action")
+            column  = rule.get("column")
+            dtype   = _CAST_ACTION_MAP.get(action)
+
+            if dtype is None or column not in df.columns:
+                continue   # not a cast rule, or column absent — skip silently
+
+            df = df.withColumn(column, col(column).cast(dtype))
+
+        return df
 
     def _add_audit_columns(self, df, source_file, batch_id):
         """Tag every row with source file, batch id, and ingestion timestamp."""
@@ -48,6 +94,8 @@ class BronzeEngine:
             .withColumn("source_file",          lit(source_file))
             .withColumn("batch_id",             lit(batch_id))
         )
+
+    # ── Write helpers ─────────────────────────────────────────────────────────
 
     def _write_reference(self, df, table_name):
         """
@@ -122,6 +170,7 @@ class BronzeEngine:
         for name, cfg in REFERENCE_TABLES.items():
             try:
                 df = self._read_csv(f"{S3_RAW}/batch_1/{cfg['source_file']}")
+                df = self._apply_bronze_casts(df, cfg)
                 df = self._add_audit_columns(df, cfg["source_file"], "batch_1")
                 self._write_reference(df, name)
             except Exception as e:
@@ -137,6 +186,7 @@ class BronzeEngine:
         for name, cfg in TRANSACTIONAL_TABLES.items():
             try:
                 df = self._read_csv(f"{S3_RAW}/batch_1/{cfg['source_file']}")
+                df = self._apply_bronze_casts(df, cfg)
                 df = self._add_audit_columns(df, cfg["source_file"], "batch_1")
                 self._write_transactional_batch1(df, name)
             except Exception as e:
@@ -153,6 +203,7 @@ class BronzeEngine:
         for name, cfg in TRANSACTIONAL_TABLES.items():
             try:
                 df = self._read_csv(f"{S3_RAW}/batch_{batch_number}/{cfg['source_file']}")
+                df = self._apply_bronze_casts(df, cfg)
                 df = self._add_audit_columns(df, cfg["source_file"], batch_id)
                 self._write_transactional_append(df, name)
             except Exception as e:
@@ -161,13 +212,24 @@ class BronzeEngine:
 
     def ingest_live(self):
         """
-        Append live stream CSVs partitioned under batch_id=live_stream/.
+        Append live stream CSVs partitioned under batch_id=live_stream.
+
+        Uses a glob path (*<source_file>) to match timestamped filenames
+        in S3_LIVE — e.g. 20260423_073255_orders_dataset.csv — without
+        needing to know the exact timestamp prefix.
+
+        _apply_bronze_casts() enforces column types declared in
+        cleaning_rules before the append, preventing schema mismatch errors
+        (e.g. review_score inferred as String vs existing IntegerType in Delta).
+
         No checkpoint needed — files are archived after each successful run.
         """
         print("\n  Live stream (append, partitioned by batch_id=live_stream):")
         for name, cfg in TRANSACTIONAL_TABLES.items():
             try:
-                df = self._read_csv(f"{S3_LIVE}/{cfg['source_file']}")
+                # Glob picks up any timestamp-prefixed variant of the file
+                df = self._read_csv(f"{S3_LIVE}/*{cfg['source_file']}")
+                df = self._apply_bronze_casts(df, cfg)
                 df = self._add_audit_columns(df, cfg["source_file"], "live_stream")
                 self._write_transactional_append(df, name)
             except Exception as e:

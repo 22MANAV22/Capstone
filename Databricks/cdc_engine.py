@@ -18,6 +18,13 @@ Why cleaning is done here and not as a separate Silver step:
 MERGE handles:
   - New orders that don't exist in Silver yet  → INSERT
   - Updated orders (e.g. status changed)       → UPDATE
+
+FIX — DELTA_SCHEMA_NOT_PROVIDED:
+  CREATE OR REPLACE TABLE fails on newer Databricks runtimes when no
+  schema is provided inline and the statement is not backed by an
+  AS SELECT. Replaced with CREATE TABLE IF NOT EXISTS which simply
+  registers the existing Delta path in the catalog without touching
+  the schema — safe to call even if the table is already registered.
 """
 
 from delta.tables import DeltaTable
@@ -34,6 +41,22 @@ class CDCEngine:
         # Borrow SilverEngine only for its _apply_rule() method.
         # We do NOT call silver.run() — that would overwrite reference tables.
         self.silver  = SilverEngine(spark)
+
+    def _register_catalog(self, table_name, silver_path):
+        """
+        Register (or re-register) a Delta path in the Silver catalog.
+
+        Uses CREATE TABLE IF NOT EXISTS instead of CREATE OR REPLACE TABLE
+        to avoid DELTA_SCHEMA_NOT_PROVIDED — the latter requires an inline
+        schema definition on newer Databricks runtimes when no AS SELECT
+        is provided. IF NOT EXISTS is safe to call on every run: it's a
+        no-op if the table is already registered, and creates the entry
+        if it isn't.
+        """
+        self.spark.sql(
+            f"CREATE TABLE IF NOT EXISTS silver.{table_name} "
+            f"USING DELTA LOCATION '{silver_path}'"
+        )
 
     def merge_table(self, table_name, config):
         merge_keys = config.get("merge_keys", [])
@@ -59,7 +82,26 @@ class CDCEngine:
             print(f"    No live rows found in Bronze. Skipping.")
             return
 
-        print(f"    Live rows before cleaning: {live_count:,}")
+        print(f"    Live rows before dedup: {live_count:,}")
+
+        # ── Deduplicate BEFORE cleaning ───────────────────────────────────────
+        # Delta MERGE fails with DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW
+        # if the source DataFrame contains more than one row with the same
+        # merge key. This happens when live files accumulate in S3 without
+        # archiving — Bronze live_stream partition grows across runs and
+        # contains duplicate keys from repeated ingestion of the same records.
+        #
+        # Dedup uses dedup_keys from config if defined, falling back to
+        # merge_keys — every table must be deduplicated on its merge key
+        # at minimum, regardless of whether dedup_keys is explicitly set,
+        # to guarantee at most one source row per target row in the MERGE.
+        dedup_keys = config.get("dedup_keys") or merge_keys
+        before  = df_live.count()
+        df_live = df_live.dropDuplicates(dedup_keys)
+        after   = df_live.count()
+        if before != after:
+            print(f"    Deduplication removed {before - after} duplicate rows")
+        print(f"    Live rows after dedup: {after:,}")
 
         # ── Apply Silver cleaning rules to live rows ──────────────────────────
         # Raw live rows from Lambda go through the same type casts, null fills,
@@ -73,16 +115,6 @@ class CDCEngine:
         #   review_comment_title      → null filled with ""
         for rule in config.get("cleaning_rules", []):
             df_live = self.silver._apply_rule(df_live, rule)
-
-        # Deduplicate on the business key — Lambda can occasionally write
-        # duplicate rows if it retries a failed invocation
-        dedup_keys = config.get("dedup_keys", [])
-        if dedup_keys:
-            before  = df_live.count()
-            df_live = df_live.dropDuplicates(dedup_keys)
-            after   = df_live.count()
-            if before != after:
-                print(f"    Deduplication removed {before - after} duplicate rows")
 
         df_live = df_live.withColumn("cdc_merge_timestamp", current_timestamp())
 
@@ -98,10 +130,7 @@ class CDCEngine:
             # Handles edge case where live stream fires before any batch ran.
             print(f"    Silver.{table_name} not found. Creating from live data.")
             df_live.write.format("delta").mode("overwrite").save(silver_path)
-            self.spark.sql(
-                f"CREATE OR REPLACE TABLE silver.{table_name} "
-                f"USING DELTA LOCATION '{silver_path}'"
-            )
+            self._register_catalog(table_name, silver_path)
             self.results[table_name] = df_live.count()
             return
 
@@ -118,11 +147,8 @@ class CDCEngine:
             .execute()
         )
 
-        # Re-register catalog entry after MERGE
-        self.spark.sql(
-            f"CREATE OR REPLACE TABLE silver.{table_name} "
-            f"USING DELTA LOCATION '{silver_path}'"
-        )
+        # Re-register catalog entry after MERGE — no-op if already registered
+        self._register_catalog(table_name, silver_path)
 
         final_count = self.spark.read.format("delta").load(silver_path).count()
         self.results[table_name] = final_count
